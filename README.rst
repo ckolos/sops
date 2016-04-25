@@ -11,39 +11,32 @@ SOPS: Secrets OPerationS
 .. sectnum::
 .. contents:: Table of Contents
 
-Up and running in 60 seconds
-----------------------------
-First install some libraries from your package manager:
+Installation
+------------
 
 * RHEL family::
 
 	sudo yum install gcc git libffi-devel libyaml-devel make openssl openssl-devel python-devel python-pip
+	sudo pip install --upgrade sops
 
 * Debian family::
 
 	sudo apt-get install gcc git libffi-dev libssl-dev libyaml-dev make openssl python-dev python-pip
-
-* MacOS::
-
-	brew install libffi libyaml
-	sudo easy_install pip
-
-Then install `sops` from pip::
-
 	sudo pip install --upgrade sops
 
-Clone the repository, load the test PGP key and open the test files::
+* MacOS Brew Install::
 
-	$ git clone https://github.com/mozilla/sops.git
-	$ cd sops
-	$ gpg --import tests/sops_functional_tests_key.asc
-	$ sops example.yaml
+	brew install sops
 
-This last step will decrypt `example.yaml` using the test private key. To create
-your own secrets files using keys under your control, keep reading.
+* MacOS Manual Install::
 
-Install in a virtualenv
-~~~~~~~~~~~~~~~~~~~~~~~
+	brew install libffi libyaml python [1]
+	pip install sops
+
+1. http://docs.python-guide.org/en/latest/starting/install/osx/#doing-it-right
+
+In a virtualenv
+~~~~~~~~~~~~~~~
 
 Assuming you already have libffi and libyaml installed, the following commands will install sops in a virtualenv:
 
@@ -53,8 +46,20 @@ Assuming you already have libffi and libyaml installed, the following commands w
     $ virtualenv ~/sopsvenv
     $ source ~/sopsvenv/bin/activate
     $ pip install -U sops
-    $ sops -h | grep ^Version
-    Version 1.0
+    $ sops -v
+    sops 1.9
+
+Test with the dev PGP key
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Clone the repository, load the test PGP key and open the test files::
+
+	$ git clone https://github.com/mozilla/sops.git
+	$ cd sops
+	$ gpg --import tests/sops_functional_tests_key.asc
+	$ sops example.yaml
+
+This last step will decrypt `example.yaml` using the test private key. To create
+your own secrets files using keys under your control, keep reading.
 
 Usage
 -----
@@ -274,8 +279,161 @@ KMS and PGP master keys defined in the file.
 
 	sops -r example.yaml
 
+Using .sops.yaml conf to select KMS/PGP for new files
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+It is often tedious to specify the `--kms` and `--pgp` parameters for creation
+of all new files. If your secrets are stored under a specific directory, like a
+`git` repository, you can create a `.sops.yaml` configuration file at the root
+directory to define which keys are used for which filename.
+
+Let's take an example:
+
+* file named **something.dev.yaml** should use one set of KMS A
+* file named **something.prod.yaml** should use another set of KMS B
+* other files use a third set of KMS C
+* all live under **mysecretrepo/something.{dev,prod}.yaml**
+
+Under those circumstances, a file placed at **mysecretrepo/.sops.yaml**
+can manage the three sets of configurations for the three types of files:
+
+.. code:: yaml
+
+	# creation rules are evaluated sequentially, the first match wins
+	creation_rules:
+		# upon creation of a file that matches the pattern *.dev.yaml,
+		# KMS set A is used
+		- filename_regex: \.dev\.yaml$
+		  kms: 'arn:aws:kms:us-west-2:927034868273:key/fe86dd69-4132-404c-ab86-4269956b4500,arn:aws:kms:us-west-2:361527076523:key/5052f06a-5d3f-489e-b86c-57201e06f31e+arn:aws:iam::361527076523:role/hiera-sops-prod'
+		  pgp: '1022470DE3F0BC54BC6AB62DE05550BC07FB1A0A'
+
+		# prod files use KMS set B in the PROD IAM
+		- filename_regex: \.prod\.yaml$
+		  kms: 'arn:aws:kms:us-west-2:361527076523:key/5052f06a-5d3f-489e-b86c-57201e06f31e+arn:aws:iam::361527076523:role/hiera-sops-prod,arn:aws:kms:eu-central-1:361527076523:key/cb1fab90-8d17-42a1-a9d8-334968904f94+arn:aws:iam::361527076523:role/hiera-sops-prod'
+		  pgp: '1022470DE3F0BC54BC6AB62DE05550BC07FB1A0A'
+
+		# Finally, if the rules above have not matched, this one is a
+		# catchall that will encrypt the file using KMS set C
+		# The absence of a filename_regex means it will match everything
+		- kms: 'arn:aws:kms:us-west-2:927034868273:key/fe86dd69-4132-404c-ab86-4269956b4500,arn:aws:kms:us-west-2:142069644989:key/846cfb17-373d-49b9-8baf-f36b04512e47,arn:aws:kms:us-west-2:361527076523:key/5052f06a-5d3f-489e-b86c-57201e06f31e'
+		  pgp: '1022470DE3F0BC54BC6AB62DE05550BC07FB1A0A'
+
+When creating any file under **mysecretrepo**, whether at the root or under
+a subdirectory, sops will recursively look for a `.sops.yaml` file. If one is
+found, the filename of the file being created is compared with the filename
+regexes of the configuration file. The first regex that matches is selected,
+and its KMS and PGP keys are used to encrypt the file.
+
+Creating a new file with the right keys is now as simple as
+
+.. code:: bash
+
+	$ sops <newfile>.prod.yaml
+
+Note that the configuration file is ignored when KMS or PGP parameters are
+passed on the sops command line or in environment variables.
+
+Important information on types
+------------------------------
+
+YAML and JSON type extensions
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+`sops` uses the file extension to decide which encryption method to use on the file
+content. `YAML` and `JSON` files are treated as trees of data, and key/values are
+extracted from the files to only encrypt the leaf values. The tree structure is also
+used to check the integrity of the file.
+
+Therefore, if a file is encrypted using a specific format, it need to be decrypted
+in the same format. The easiest way to achieve this is to conserve the original file
+extension after encrypting a file. For example::
+
+	$ sops -e -i myfile.json
+
+	$ sops -d myfile.json
+
+If you want to change the extension of the file once encrypted, you need to provide
+sops with the `--input-type` flag upon decryption. For example::
+
+	$ sops -e myfile.json > myfile.json.enc
+
+	$ sops -d --input-type json myfile.json.enc
+
+YAML anchors
+~~~~~~~~~~~~
+`sops` only supports a subset of `YAML`'s many types. Encrypting YAML files that
+contain strings, numbers and booleans will work fine, but files that contain anchors
+will not work, because the anchors redefine the structure of the file at load time.
+
+This file will not work in `sops`:
+
+.. code:: yaml
+
+	bill-to:  &id001
+	    street: |
+	        123 Tornado Alley
+	        Suite 16
+	    city:   East Centerville
+	    state:  KS
+
+	ship-to:  *id001
+
+`sops` uses the path to a value as additional data in the AEAD encryption, and thus
+dynamic paths generated by anchors break the authentication step.
+
+JSON and TEXT file types do not support anchors and thus have no such limitation.
+
+Top-level arrays
+~~~~~~~~~~~~~~~~
+`YAML` and `JSON` top-level arrays are not supported, because `sops` needs a top-level
+`sops` key to store its metadata.
+This file will not work in sops:
+
+.. code:: yaml
+
+	---
+	  - some
+	  - array
+	  - elements
+
+But this one will because because the `sops` key can be added at the same level as the
+`data` key.
+
+.. code:: yaml
+
+	data:
+	  - some
+	  - array
+	  - elements
+
+Similarly, with `JSON` arrays, this document will not work:
+
+.. code:: json
+
+	[
+	  "some",
+	  "array",
+	  "elements"
+	]
+
+
+But this one will work just fine:
+
+.. code:: json
+
+	{
+	  "data": [
+	    "some",
+	    "array",
+	    "elements"
+	  ]
+	}
+
+
 Examples
 --------
+
+Take a look into the `examples <https://github.com/mozilla/sops/tree/master/examples>`_ folder for detailed use cases of sops in a CI environment. The section below describes specific tips for common use cases.
 
 Creating a new file
 ~~~~~~~~~~~~~~~~~~~
@@ -424,24 +582,26 @@ With this in place, calls to `git diff` will decrypt both previous and current
 versions of the target file prior to displaying the diff. And it even works with
 git client interfaces, because they call git diff under the hood!
 
-Implementation details
-----------------------
+Encrypting only parts of a file
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-YAML types limitations
-~~~~~~~~~~~~~~~~~~~~~~
+Note: this only works on YAML and JSON files, not on BINARY files.
 
-`sops` only supports a subset of `YAML`'s many types. Encrypting YAML files that
-contain strings, numbers and booleans will work fine.
+By default, `sops` encrypts all the values of a YAML or JSON file and leaves the
+keys in cleartext. In some instances, you may want to exclude some values from
+being encrypted. This can be accomplished by adding the suffix **_unencrypted**
+to any key of a file. When set, all values underneath the key that set the
+**_unencrypted** prefix will be left in cleartext.
 
-Files that contain anchors will not work, because the anchors redefine the
-structure of the file at load time. `sops` uses the path to a value as
-additional data in the AEAD encryption, and thus dynamic paths generated by
-anchors break the authentication step.
+Note that, while in cleartext, unencrypted content is still added to the
+checksum of the file, and thus cannot be modified outside of sops without
+breaking the file integrity check.
 
-JSON and TEXT file types have no such feature and do not suffer this limitation.
+The unencrypted suffix can be set to a different value using the
+`--unencrypted-suffix` option.
 
-Encryption method
-~~~~~~~~~~~~~~~~~
+Encryption Protocol
+-------------------
 
 When sops creates a file, it generates a random 256 bit data key and asks each
 KMS and PGP master key to encrypt the data key. The encrypted version of the data
@@ -681,10 +841,13 @@ Mozilla Public License Version 2.0
 
 Authors
 -------
-* Julien Vehent <jvehent@mozilla.com>
+* Julien Vehent <jvehent@mozilla.com> (lead & maintainer)
+
 * Daniel Thornton <dthornton@mozilla.com>
 * Alexis Metaireau <alexis@mozilla.com>
 * Rémy Hubscher <natim@mozilla.com>
+* Todd Wolfson <todd@twolfson.com>
+* Brian Hourigan <bhourigan@mozilla.com>
 
 Credits
 -------

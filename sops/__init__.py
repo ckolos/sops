@@ -38,7 +38,7 @@ else:
 if sys.version_info[0] == 3:
     raw_input = input
 
-VERSION = 1.2
+VERSION = '1.11'
 
 DESC = """
 `sops` supports AWS KMS and PGP encryption:
@@ -75,6 +75,9 @@ example_number: 1234.5678
 example:
     nested:
         values: delete_me
+example_booleans:
+    - true
+    - false
 """
 
 DEFAULT_JSON = """{
@@ -83,7 +86,8 @@ DEFAULT_JSON = """{
     "example_value1",
     "example_value2"
 ],
-"example_number": 1234.5678
+"example_number": 1234.5678,
+"example_booleans": [true, false]
 }"""
 
 DEFAULT_TEXT = """Welcome to SOPS!
@@ -91,9 +95,19 @@ Remove this text and add your content to the file.
 
 """
 
+DEFAULT_UNENCRYPTED_SUFFIX = '_unencrypted'
+
+""" the default name of a sops config file to be found in local directories """
+DEFAULT_CONFIG_FILE = '.sops.yaml'
+
+""" the max depth to search for a sops config file backward """
+DEFAULT_CONFIG_FILE_SEARCH_DEPTH = 100
+
 NOW = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
 
 INPUT_VERSION = VERSION
+
+UNENCRYPTED_SUFFIX = DEFAULT_UNENCRYPTED_SUFFIX
 
 
 def main():
@@ -158,6 +172,17 @@ def main():
     argparser.add_argument('--no-latest-check', action='store_true',
                            dest='nolatestcheck',
                            help="skip check for latest version of sops")
+    argparser.add_argument('--unencrypted-suffix', dest='unencrypted_suffix',
+                           help="override unencrypted key suffix "
+                                "(default: {default})"
+                                .format(default=DEFAULT_UNENCRYPTED_SUFFIX))
+    argparser.add_argument('--config', dest='config_loc',
+                           help="path to config file, disable recursive search"
+                                " (default: {default})"
+                                .format(default=DEFAULT_CONFIG_FILE))
+    argparser.add_argument('-v', '--version', action='version',
+                           version='%(prog)s ' + str(VERSION))
+
     args = argparser.parse_args()
 
     if not args.nolatestcheck:
@@ -188,22 +213,28 @@ def main():
 
     tree, need_key, existing_file = initialize_tree(args.file, itype,
                                                     kms_arns=kms_arns,
-                                                    pgp_fps=pgp_fps)
+                                                    pgp_fps=pgp_fps,
+                                                    configloc=args.config_loc)
     if not existing_file:
+        # can't use add/rm keys on new files, they don't yet have keys
         if args.add_kms or args.add_pgp or args.rm_kms or args.rm_pgp:
             panic("cannot add or remove keys on non-existent files, use "
                   "`--kms` and `--pgp` instead.", error_code=49)
-        # encrypt and decrypt modes are not available on non-existent files
+        # encrypt/decrypt methods are not available on new files, because
+        # the file doesn't exist yet.
         if (args.encrypt or args.decrypt):
             panic("cannot operate on non-existent file", error_code=100)
-        else:
-            print("%s doesn't exist, creating it." % args.file)
+        print("INFO: %s doesn't exist, creating it." % args.file)
+
+    if args.unencrypted_suffix:
+        global UNENCRYPTED_SUFFIX
+        UNENCRYPTED_SUFFIX = args.unencrypted_suffix
 
     if args.encrypt:
         # Encrypt mode: encrypt, display and exit
         key, tree = get_key(tree, need_key)
         tree = walk_and_encrypt(tree, key)
-        dest = '/dev/stdout'
+        dest = 'stdout'
         if args.in_place:
             dest = args.file
         if otype == "bytes":
@@ -218,7 +249,7 @@ def main():
         tree = walk_and_decrypt(tree, key, ignoreMac=args.ignore_mac)
         if not args.show_master_keys:
             tree.pop('sops', None)
-        dest = '/dev/stdout'
+        dest = 'stdout'
         if args.in_place:
             dest = args.file
         if args.tree_path:
@@ -238,7 +269,7 @@ def main():
         if otype == "bytes":
             otype = "json"
         path = write_file(tree, path=args.file, filetype=otype)
-        print("Data key rotated and file written to %s" % (path),
+        print("INFO: data key rotated and file written to %s" % (path),
               file=sys.stderr)
         sys.exit(0)
 
@@ -262,7 +293,7 @@ def main():
     # is opened on the file
     tmppath = write_file(tree, filetype=otype)
     tmphash = get_file_hash(tmppath)
-    print("temp file created at %s" % tmppath, file=sys.stderr)
+    print("INFO: temp file created at %s" % tmppath, file=sys.stderr)
 
     # open an editor on the file and, if the file is yaml or json,
     # verify that it doesn't contain errors before continuing
@@ -274,7 +305,7 @@ def main():
             valid_syntax = validate_syntax(tmppath, otype)
         except Exception as e:
             try:
-                print("Syntax error: %s\nPress a key to return into "
+                print("ERROR: invalid syntax: %s\nPress a key to return into "
                       "the editor, or ctrl+c to exit without saving." % e,
                       file=sys.stderr)
                 raw_input()
@@ -294,8 +325,8 @@ def main():
             has_master_keys = True
         else:
             try:
-                print("Could not find a valid master key to encrypt the "
-                      "data key with.\nAdd at least one KMS or PGP "
+                print("ERROR: could not find a valid master key to encrypt the"
+                      " data key with.\nAdd at least one KMS or PGP "
                       "master key to the `sops` branch,\nor ctrl+c to "
                       "exit without saving.")
                 raw_input()
@@ -319,15 +350,15 @@ def main():
     if otype == "bytes":
         otype = "json"
     path = write_file(tree, path=args.file, filetype=otype)
-    print("file written to %s" % (path), file=sys.stderr)
+    print("INFO: file written to %s" % (path), file=sys.stderr)
     sys.exit(0)
 
 
-def detect_filetype(file):
+def detect_filetype(filename):
     """Detect the type of file based on its extension.
     Return a string that describes the format: `bytes`, `yaml`, `json`
     """
-    base, ext = os.path.splitext(file)
+    _, ext = os.path.splitext(filename)
     if (ext == '.yaml') or (ext == '.yml'):
         return 'yaml'
     elif ext == '.json':
@@ -335,7 +366,7 @@ def detect_filetype(file):
     return 'bytes'
 
 
-def initialize_tree(path, itype, kms_arns=None, pgp_fps=None):
+def initialize_tree(path, itype, kms_arns=None, pgp_fps=None, configloc=None):
     """ Try to load the file from path in a tree, and failing that,
         initialize a new tree using default data
     """
@@ -357,14 +388,27 @@ def initialize_tree(path, itype, kms_arns=None, pgp_fps=None):
             INPUT_VERSION = tree['sops']['version']
         except:
             None
+        # try to set the unencrypted suffix to the one set in the file
+        try:
+            global UNENCRYPTED_SUFFIX
+            UNENCRYPTED_SUFFIX = tree['sops']['unencrypted_suffix']
+        except:
+            None
     else:
-        # load a new tree using template data
+        # The file does not exist, create a new tree using DEFAULT data
         if itype == "yaml":
             tree = ruamel.yaml.load(DEFAULT_YAML, ruamel.yaml.RoundTripLoader)
         elif itype == "json":
             tree = json.loads(DEFAULT_JSON, object_pairs_hook=OrderedDict)
         else:
             tree['data'] = DEFAULT_TEXT
+        if not kms_arns and not pgp_fps:
+            # if no kms or pgp was provided on the command line or environment
+            # variables, look for a config file to get the values from
+            config = find_config_for_file(path, configloc)
+            if config:
+                kms_arns = config.get("kms", None)
+                pgp_fps = config.get("pgp", None)
         tree, need_key = verify_or_create_sops_branch(tree, kms_arns, pgp_fps)
     return tree, need_key, existing_file
 
@@ -398,6 +442,7 @@ def load_file_into_tree(path, filetype, restore_sops=None):
                 if "version" not in tree['sops']:
                     tree['data'] = data
             except:
+                tree = OrderedDict()
                 valre = b'(.+)^SOPS=({.+})$'
                 res = re.match(valre, data, flags=(re.MULTILINE | re.DOTALL))
                 if res is None:
@@ -405,9 +450,53 @@ def load_file_into_tree(path, filetype, restore_sops=None):
                 else:
                     tree['data'] = res.group(1)
                     tree['sops'] = json.loads(res.group(2))
+    if tree is None:
+        panic("failed to load file into tree, got an empty tree", 39)
     if restore_sops:
         tree['sops'] = restore_sops.copy()
     return tree
+
+
+def find_config_for_file(filename, configloc):
+    if not filename:
+        return None
+    config = dict()
+    if not configloc:
+        # If a specific location is not specified, try to find a file
+        # by search from the current dir backward, up until we hit a
+        # defined limit of levels.
+        for i in range(DEFAULT_CONFIG_FILE_SEARCH_DEPTH):
+            try:
+                os.stat((i * "../") + DEFAULT_CONFIG_FILE)
+            except:
+                continue
+            # when we find a file, exit the loop
+            configloc = (i * "../") + DEFAULT_CONFIG_FILE
+            break
+    if not configloc:
+        # no configuration was found
+        return None
+    # load the config file as yaml and look for creation rules that
+    # contain a regex that matches the current filename
+    try:
+        with open(configloc, "rb") as filedesc:
+            config = ruamel.yaml.load(filedesc, ruamel.yaml.RoundTripLoader)
+    except IOError:
+        panic("no configuration file found at '%s'" % configloc, 61)
+    if 'creation_rules' not in config:
+        return None
+    for rule in config["creation_rules"]:
+        # if the rule contains a filename regex, try to match it
+        # against the current filename to see if the rule applies.
+        #
+        # if no filename_regex is provided, assume the rule is a
+        # catchall and apply it to the file
+        if "filename_regex" in rule:
+            if not re.search(rule["filename_regex"], filename):
+                continue
+        print("INFO found a configuration for '%s' in '%s'" % (filename,
+              configloc), file=sys.stderr)
+        return rule
 
 
 def verify_or_create_sops_branch(tree, kms_arns=None, pgp_fps=None):
@@ -424,26 +513,30 @@ def verify_or_create_sops_branch(tree, kms_arns=None, pgp_fps=None):
         tree['sops']['attention'] = 'This section contains key material' + \
             ' that should only be modified with extra care. See `sops -h`.'
         tree['sops']['version'] = VERSION
+        tree['sops']['unencrypted_suffix'] = UNENCRYPTED_SUFFIX
 
     if 'kms' in tree['sops'] and isinstance(tree['sops']['kms'], list):
         # check that we have at least one ARN to work with
         for entry in tree['sops']['kms']:
-            if 'arn' in entry and entry['arn'] != "" and entry['enc'] != "":
+            if (entry and 'arn' in entry and entry['arn'] != "" and
+               'enc' in entry and entry['enc'] != ""):
                 return tree, need_new_data_key
 
-    # if we're here, no arn was found
+    # if we're here, no data key was found in the kms entries
     if 'pgp' in tree['sops'] and isinstance(tree['sops']['pgp'], list):
         # check that we have at least one fingerprint to work with
         for entry in tree['sops']['pgp']:
-            if 'fp' in entry and entry['fp'] != "" and entry['enc'] != "":
+            if (entry and 'fp' in entry and entry['fp'] != "" and
+               'enc' in entry and entry['enc'] != ""):
                 return tree, need_new_data_key
 
-    # if we're here, no pgp fingerprint was found either
+    # if we're here, no data key was found in the pgp entries either.
+    # we need a new data key
     has_at_least_one_method = False
     need_new_data_key = True
-    if not (kms_arns is None):
+    if kms_arns:
         tree, has_at_least_one_method = parse_kms_arn(tree, kms_arns)
-    if not (pgp_fps is None):
+    if pgp_fps:
         tree, has_at_least_one_method = parse_pgp_fp(tree, pgp_fps)
     if not has_at_least_one_method:
         panic("Error: No KMS ARN or PGP Fingerprint found to encrypt the data "
@@ -492,10 +585,12 @@ def update_master_keys(tree, key):
             panic("invalid KMS format in SOPS branch, must be a list")
         i = -1
         for entry in tree['sops']['kms']:
+            if not entry:
+                continue
             i += 1
             # encrypt data key with master key if enc value is empty
             if not ('enc' in entry) or entry['enc'] == "":
-                print("updating kms entry")
+                print("INFO: updating kms entry", file=sys.stderr)
                 updated = encrypt_key_with_kms(key, entry)
                 tree['sops']['kms'][i] = updated
 
@@ -504,19 +599,28 @@ def update_master_keys(tree, key):
             panic("invalid PGP format in SOPS branch, must be a list")
         i = -1
         for entry in tree['sops']['pgp']:
+            if not entry:
+                continue
             i += 1
             # encrypt data key with master key if enc value is empty
             if not ('enc' in entry) or entry['enc'] == "":
-                print("updating pgp entry")
+                print("INFO: updating pgp entry", file=sys.stderr)
                 updated = encrypt_key_with_pgp(key, entry)
                 tree['sops']['pgp'][i] = updated
 
     # update version number if newer than current
     if 'version' in tree['sops']:
-        if tree['sops']['version'] < VERSION:
+        if A_is_newer_than_B(VERSION, tree['sops']['version']):
             tree['sops']['version'] = VERSION
     else:
         tree['sops']['version'] = VERSION
+
+    # update unencrypted suffix if it varies
+    if 'unencrypted_suffix' in tree['sops']:
+        if tree['sops']['unencrypted_suffix'] != UNENCRYPTED_SUFFIX:
+            tree['sops']['unencrypted_suffix'] = UNENCRYPTED_SUFFIX
+    else:
+        tree['sops']['unencrypted_suffix'] = UNENCRYPTED_SUFFIX
 
     return tree
 
@@ -527,10 +631,14 @@ def check_master_keys(tree):
     """
     if 'kms' in tree['sops']:
         for entry in tree['sops']['kms']:
+            if not entry:
+                continue
             if 'arn' in entry and entry['arn'] != "":
                 return True
     if 'pgp' in tree['sops']:
         for entry in tree['sops']['pgp']:
+            if not entry:
+                continue
             if 'fp' in entry and entry['fp'] != "":
                 return True
     return False
@@ -551,6 +659,8 @@ def add_new_master_keys(tree, new_kms, new_pgp):
                     continue
                 shouldadd = True
                 for entry in tree['sops']['kms']:
+                    if not entry:
+                        continue
                     if newentry['arn'] == entry['arn']:
                         # arn already present, don't re-add it
                         shouldadd = False
@@ -568,6 +678,8 @@ def add_new_master_keys(tree, new_kms, new_pgp):
                     continue
                 shouldadd = True
                 for entry in tree['sops']['pgp']:
+                    if not entry:
+                        continue
                     if newentry['fp'] == entry['fp']:
                         # arn already present, don't re-add it
                         shouldadd = False
@@ -589,6 +701,8 @@ def remove_master_keys(tree, rm_kms, rm_pgp):
             for rmentry in newtree['sops']['kms']:
                 i = 0
                 for entry in tree['sops']['kms']:
+                    if not entry:
+                        continue
                     if rmentry['arn'] == entry['arn']:
                         del tree['sops']['kms'][i]
                     i += 1
@@ -600,6 +714,8 @@ def remove_master_keys(tree, rm_kms, rm_pgp):
             for rmentry in newtree['sops']['pgp']:
                 i = 0
                 for entry in tree['sops']['pgp']:
+                    if not entry:
+                        continue
                     if rmentry['fp'] == entry['fp']:
                         del tree['sops']['pgp'][i]
                     i += 1
@@ -607,7 +723,7 @@ def remove_master_keys(tree, rm_kms, rm_pgp):
 
 
 def walk_and_decrypt(branch, key, aad=b'', stash=None, digest=None,
-                     isRoot=True, ignoreMac=False):
+                     isRoot=True, ignoreMac=False, unencrypted=False):
     """Walk the branch recursively and decrypt leaves."""
     if isRoot and not ignoreMac:
         digest = hashlib.sha512()
@@ -615,9 +731,10 @@ def walk_and_decrypt(branch, key, aad=b'', stash=None, digest=None,
     for k, v in branch.items():
         if k == 'sops' and isRoot:
             continue    # everything under the `sops` key stays in clear
+        unencrypted_branch = unencrypted or k.endswith(UNENCRYPTED_SUFFIX)
         nstash = dict()
         caad = aad
-        if INPUT_VERSION >= 0.9:
+        if A_is_newer_than_B(INPUT_VERSION, '0.9'):
             caad = aad + k.encode('utf-8') + b':'
         else:
             caad = carryaad
@@ -628,15 +745,19 @@ def walk_and_decrypt(branch, key, aad=b'', stash=None, digest=None,
             nstash = stash[k]
         if isinstance(v, dict):
             branch[k] = walk_and_decrypt(v, key, aad=caad, stash=nstash,
-                                         digest=digest, isRoot=False)
+                                         digest=digest, isRoot=False,
+                                         unencrypted=unencrypted_branch)
         elif isinstance(v, list):
             branch[k] = walk_list_and_decrypt(v, key, aad=caad, stash=nstash,
-                                              digest=digest)
+                                              digest=digest,
+                                              unencrypted=unencrypted_branch)
         elif isinstance(v, ruamel.yaml.scalarstring.PreservedScalarString):
-            ev = decrypt(v, key, aad=caad, stash=nstash, digest=digest)
+            ev = decrypt(v, key, aad=caad, stash=nstash, digest=digest,
+                         unencrypted=unencrypted_branch)
             branch[k] = ruamel.yaml.scalarstring.PreservedScalarString(ev)
         else:
-            branch[k] = decrypt(v, key, aad=caad, stash=nstash, digest=digest)
+            branch[k] = decrypt(v, key, aad=caad, stash=nstash, digest=digest,
+                                unencrypted=unencrypted_branch)
 
     if isRoot and not ignoreMac:
         # compute the hash computed on values with the one stored
@@ -655,7 +776,8 @@ def walk_and_decrypt(branch, key, aad=b'', stash=None, digest=None,
     return branch
 
 
-def walk_list_and_decrypt(branch, key, aad=b'', stash=None, digest=None):
+def walk_list_and_decrypt(branch, key, aad=b'', stash=None, digest=None,
+                          unencrypted=False):
     """Walk a list contained in a branch and decrypts its values."""
     nstash = dict()
     kl = []
@@ -665,20 +787,29 @@ def walk_list_and_decrypt(branch, key, aad=b'', stash=None, digest=None):
             nstash = stash[i]
         if isinstance(v, dict):
             kl.append(walk_and_decrypt(v, key, aad=aad, stash=nstash,
-                                       digest=digest, isRoot=False))
+                                       digest=digest, isRoot=False,
+                                       unencrypted=unencrypted))
         elif isinstance(v, list):
             kl.append(walk_list_and_decrypt(v, key, aad=aad, stash=nstash,
-                                            digest=digest))
+                                            digest=digest,
+                                            unencrypted=unencrypted))
         else:
-            kl.append(decrypt(v, key, aad=aad, stash=nstash, digest=digest))
+            kl.append(decrypt(v, key, aad=aad, stash=nstash, digest=digest,
+                              unencrypted=unencrypted))
     return kl
 
 
-def decrypt(value, key, aad=b'', stash=None, digest=None):
+def decrypt(value, key, aad=b'', stash=None, digest=None, unencrypted=False):
     """Return a decrypted value."""
+    if unencrypted:
+        if digest:
+            bvalue = to_bytes(value)
+            digest.update(bvalue)
+        return value
+
     valre = b'^ENC\[AES256_GCM,data:(.+),iv:(.+),tag:(.+)'
     # extract fields using a regex
-    if INPUT_VERSION >= 0.8:
+    if A_is_newer_than_B(INPUT_VERSION, '0.8'):
         valre += b',type:(.+)'
     valre += b'\]'
     res = re.match(valre, value.encode('utf-8'))
@@ -689,7 +820,7 @@ def decrypt(value, key, aad=b'', stash=None, digest=None):
     iv = b64decode(res.group(2))
     tag = b64decode(res.group(3))
     valtype = 'str'
-    if INPUT_VERSION >= 0.8:
+    if A_is_newer_than_B(INPUT_VERSION, '0.8'):
         valtype = res.group(4)
     decryptor = Cipher(algorithms.AES(key),
                        modes.GCM(iv, tag),
@@ -735,13 +866,14 @@ def decrypt(value, key, aad=b'', stash=None, digest=None):
 
 
 def walk_and_encrypt(branch, key, aad=b'', stash=None,
-                     isRoot=True, digest=None):
+                     isRoot=True, digest=None, unencrypted=False):
     """Walk the branch recursively and encrypts its leaves."""
     if isRoot:
         digest = hashlib.sha512()
     for k, v in branch.items():
         if k == 'sops' and isRoot:
             continue    # everything under the `sops` key stays in clear
+        unencrypted_branch = unencrypted or k.endswith(UNENCRYPTED_SUFFIX)
         caad = aad + k.encode('utf-8') + b':'
         nstash = dict()
         if stash and k in stash:
@@ -749,15 +881,19 @@ def walk_and_encrypt(branch, key, aad=b'', stash=None,
         if isinstance(v, dict):
             # recursively walk the tree
             branch[k] = walk_and_encrypt(v, key, aad=caad, stash=nstash,
-                                         digest=digest, isRoot=False)
+                                         digest=digest, isRoot=False,
+                                         unencrypted=unencrypted_branch)
         elif isinstance(v, list):
             branch[k] = walk_list_and_encrypt(v, key, aad=caad, stash=nstash,
-                                              digest=digest)
+                                              digest=digest,
+                                              unencrypted=unencrypted_branch)
         elif isinstance(v, ruamel.yaml.scalarstring.PreservedScalarString):
-            ev = encrypt(v, key, aad=caad, stash=nstash, digest=digest)
+            ev = encrypt(v, key, aad=caad, stash=nstash, digest=digest,
+                         unencrypted=unencrypted_branch)
             branch[k] = ruamel.yaml.scalarstring.PreservedScalarString(ev)
         else:
-            branch[k] = encrypt(v, key, aad=caad, stash=nstash, digest=digest)
+            branch[k] = encrypt(v, key, aad=caad, stash=nstash, digest=digest,
+                                unencrypted=unencrypted_branch)
     if isRoot:
         branch['sops']['lastmodified'] = NOW
         # finalize and store the message authentication code in encrypted form
@@ -769,7 +905,8 @@ def walk_and_encrypt(branch, key, aad=b'', stash=None,
     return branch
 
 
-def walk_list_and_encrypt(branch, key, aad=b'', stash=None, digest=None):
+def walk_list_and_encrypt(branch, key, aad=b'', stash=None, digest=None,
+                          unencrypted=False):
     """Walk a list contained in a branch and encrypts its values."""
     nstash = dict()
     kl = []
@@ -778,18 +915,31 @@ def walk_list_and_encrypt(branch, key, aad=b'', stash=None, digest=None):
             nstash = stash[i]
         if isinstance(v, dict):
             kl.append(walk_and_encrypt(v, key, aad=aad, stash=nstash,
-                                       digest=digest, isRoot=False))
+                                       digest=digest, isRoot=False,
+                                       unencrypted=unencrypted))
         elif isinstance(v, list):
             kl.append(walk_list_and_encrypt(v, key, aad=aad, stash=nstash,
-                                            digest=digest))
+                                            digest=digest,
+                                            unencrypted=unencrypted))
         else:
             kl.append(encrypt(v, key, aad=aad, stash=nstash,
-                              digest=digest))
+                              digest=digest, unencrypted=unencrypted))
     return kl
 
 
-def encrypt(value, key, aad=b'', stash=None, digest=None):
+def encrypt(value, key, aad=b'', stash=None, digest=None, unencrypted=False):
     """Return an encrypted string of the value provided."""
+    if not value and not isinstance(value, bool):
+        # if the value is empty, return it as is, don't encrypt
+        return ""
+
+    # if we don't want to encrypt, then digest return the value
+    if unencrypted:
+        if digest:
+            bvalue = to_bytes(value)
+            digest.update(bvalue)
+        return value
+
     # save the original type
     # the order in which we do this matters. For example, a bool
     # is also an int, but an int isn't a bool, so we test for bool first
@@ -805,10 +955,7 @@ def encrypt(value, key, aad=b'', stash=None, digest=None):
     else:
         valtype = 'bytes'
 
-    if not isinstance(value, bytes):
-        # if not bytes, convert to bytes
-        value = str(value).encode('utf-8')
-
+    value = to_bytes(value)
     if digest:
         digest.update(value)
 
@@ -842,29 +989,38 @@ def get_key(tree, need_key=False):
     """
     if need_key:
         # if we're here, the tree doesn't have a key yet. generate
-        # one and store it in the tree
-        print("please wait while a data encryption key is being generated"
-              " and stored securely", file=sys.stderr)
+        # one, encrypt it with every KMS and PGP master key configured,
+        # and store them into the sops tree. If one master key is not
+        # available, panic and exit.
+        print("INFO: generating and storing data encryption key",
+              file=sys.stderr)
         key = os.urandom(32)
-        has_at_least_one_method = False
         if 'kms' in tree['sops']:
             i = -1
             for entry in tree['sops']['kms']:
+                if not entry:
+                    continue
                 i += 1
                 updated = encrypt_key_with_kms(key, entry)
+                if updated is None:
+                    panic("Failed to encrypt data key with KMS %s. "
+                          "Verify your AWS credentials and session "
+                          "and try again." % entry['arn'])
                 if 'enc' in updated and updated['enc'] != "":
                     tree['sops']['kms'][i] = updated
-                    has_at_least_one_method = True
         if 'pgp' in tree['sops']:
             i = -1
             for entry in tree['sops']['pgp']:
+                if not entry:
+                    continue
                 i += 1
                 updated = encrypt_key_with_pgp(key, entry)
+                if updated is None:
+                    panic("Failed to encrypt data key with PGP %s. "
+                          "Make sure you have the public key locally with "
+                          "$ gpg --recv-keys %s" % (entry['fp'], entry['fp']))
                 if 'enc' in updated and updated['enc'] != "":
                     tree['sops']['pgp'][i] = updated
-                    has_at_least_one_method = True
-        if not has_at_least_one_method:
-            panic("No method available to store new data key, aborting", 37)
         return key, tree
     key = get_key_from_kms(tree)
     if not (key is None):
@@ -883,44 +1039,54 @@ def get_key_from_kms(tree):
     except KeyError:
         return None
     i = -1
+    errors = []
     for entry in kms_tree:
+        if not entry:
+            continue
         i += 1
         try:
             enc = entry['enc']
         except KeyError:
             continue
         if 'arn' not in entry or entry['arn'] == "":
-            print("KMS ARN not found, skipping entry %s" % i, file=sys.stderr)
-            continue
-        kms = get_aws_session_for_entry(entry)
-        if kms is None:
-            print("failed to initialize AWS KMS client for entry",
+            print("WARN: KMS ARN not found, skipping entry %s" % i,
                   file=sys.stderr)
+            continue
+        kms, err = get_aws_session_for_entry(entry)
+        if err != "":
+            errors.append("failed to obtain kms %s, error was: %s" %
+                          (entry['arn'], err))
+            continue
+        if kms is None:
+            errors.append("no kms client could be obtained for entry %s" %
+                          entry['arn'])
             continue
         try:
             kms_response = kms.decrypt(CiphertextBlob=b64decode(enc))
         except Exception as e:
-            print("[warning] skipping kms %s: %s " % (entry['arn'], e),
-                  file=sys.stderr)
+            errors.append("kms %s failed with error: %s " % (entry['arn'], e))
             continue
         return kms_response['Plaintext']
+    print("WARN: no KMS client could be accessed:", file=sys.stderr)
+    for err in errors:
+        print("* %s" % err, file=sys.stderr)
     return None
 
 
 def encrypt_key_with_kms(key, entry):
     """Encrypt the key using the KMS."""
     if 'arn' not in entry or entry['arn'] == "":
-        print("KMS ARN not found, skipping entry", file=sys.stderr)
-        return entry
-    kms = get_aws_session_for_entry(entry)
-    if kms is None:
-        print("failed to initialize AWS KMS client for entry",
+        print("ERROR: KMS ARN not found", file=sys.stderr)
+        return None
+    kms, err = get_aws_session_for_entry(entry)
+    if kms is None or err != "":
+        print("ERROR: failed to initialize AWS KMS client for entry: %s" % err,
               file=sys.stderr)
-        return entry
+        return None
     try:
         kms_response = kms.encrypt(KeyId=entry['arn'], Plaintext=key)
     except Exception as e:
-        print("failed to encrypt key using kms arn %s: %s, skipping it" %
+        print("ERROR: failed to encrypt key using kms arn %s: %s" %
               (entry['arn'], e), file=sys.stderr)
         return None
     entry['enc'] = b64encode(
@@ -935,37 +1101,39 @@ def get_aws_session_for_entry(entry):
     # arn:aws:kms:{REGION}:...
     res = re.match('^arn:aws:kms:(.+):([0-9]+):key/(.+)$', entry['arn'])
     if res is None:
-        print("Invalid ARN '%s' in entry" % entry['arn'], file=sys.stderr)
-        return None
+        return (None, "Invalid ARN '%s' in entry" % entry['arn'])
     try:
         region = res.group(1)
     except:
-        print("Unable to find region from ARN '%s' in entry" %
-              entry['arn'], file=sys.stderr)
-        return None
+        return (None, "Unable to find region from ARN '%s' in entry" %
+                      entry['arn'])
     # if there are no role to assume, return the client directly
     if not ('role' in entry):
-        return boto3.client('kms', region_name=region)
+        try:
+            cli = boto3.client('kms', region_name=region)
+        except:
+            return (None, "Unable to get boto3 client in %s" % region)
+        return (cli, "")
     # otherwise, create a client using temporary tokens that assume the role
     try:
         client = boto3.client('sts')
         role = client.assume_role(RoleArn=entry['role'],
                                   RoleSessionName='sops@'+gethostname())
     except Exception as e:
-        print("Unable to switch roles: %s" % e, file=sys.stderr)
-        return None
+        return (None, "Unable to switch roles: %s" % e)
     try:
-        print("Assuming AWS role '%s'" % role['AssumedRoleUser']['Arn'],
+        print("INFO: assuming AWS role '%s'" % role['AssumedRoleUser']['Arn'],
               file=sys.stderr)
         keyid = role['Credentials']['AccessKeyId']
         secretkey = role['Credentials']['SecretAccessKey']
         token = role['Credentials']['SessionToken']
-        return boto3.client('kms', region_name=region,
-                            aws_access_key_id=keyid,
-                            aws_secret_access_key=secretkey,
-                            aws_session_token=token)
+        return (boto3.client('kms', region_name=region,
+                             aws_access_key_id=keyid,
+                             aws_secret_access_key=secretkey,
+                             aws_session_token=token),
+                "")
     except KeyError:
-        return None
+        return (None, "failed to initialize KMS client")
 
 
 def get_key_from_pgp(tree):
@@ -976,6 +1144,8 @@ def get_key_from_pgp(tree):
         return None
     i = -1
     for entry in pgp_tree:
+        if not entry:
+            continue
         i += 1
         try:
             enc = entry['enc']
@@ -986,7 +1156,7 @@ def get_key_from_pgp(tree):
                                  stdin=subprocess.PIPE)
             key = p.communicate(input=enc.encode('utf-8'))[0]
         except Exception as e:
-            print("PGP decryption failed in entry %s with error: %s" %
+            print("INFO: PGP decryption failed in entry %s with error: %s" %
                   (i, e), file=sys.stderr)
             continue
         if len(key) == 32:
@@ -997,8 +1167,8 @@ def get_key_from_pgp(tree):
 def encrypt_key_with_pgp(key, entry):
     """Encrypt the key using the PGP key."""
     if 'fp' not in entry or entry['fp'] == "":
-        print("PGP fingerprint not found, skipping entry", file=sys.stderr)
-        return entry
+        print("ERROR: PGP fingerprint not found", file=sys.stderr)
+        return None
     fp = entry['fp']
     try:
         p = subprocess.Popen(['gpg', '--no-default-recipient', '--yes',
@@ -1008,8 +1178,10 @@ def encrypt_key_with_pgp(key, entry):
                              stdin=subprocess.PIPE)
         enc = p.communicate(input=key)[0]
     except Exception as e:
-        print("failed to encrypt key using pgp fp %s: %s, skipping it" %
+        print("ERROR: failed to encrypt key using pgp fp %s: %s" %
               (fp, e), file=sys.stderr)
+        return None
+    if p.returncode > 0:
         return None
     enc = enc.decode('utf-8')
     entry['enc'] = ruamel.yaml.scalarstring.PreservedScalarString(enc)
@@ -1029,32 +1201,60 @@ def write_file(tree, path=None, filetype=None):
 
     """
     if path:
-        fd = open(path, "wb")
+        if path != 'stdout':
+            fd = open(path, "wb")
+        else:
+            fd = None
     else:
         fd = tempfile.NamedTemporaryFile(suffix="."+filetype, delete=False)
         path = fd.name
 
-    if not isinstance(tree, dict) and not isinstance(tree, list):
+    if fd and not isinstance(tree, dict) and not isinstance(tree, list):
+        # Write the entire tree to file descriptor
         fd.write(tree.encode('utf-8'))
         fd.close()
         return path
 
     if filetype == "yaml":
-        fd.write(ruamel.yaml.dump(tree, Dumper=ruamel.yaml.RoundTripDumper,
-                                  indent=4).encode('utf-8'))
+        if path == 'stdout':
+            sys.stdout.write(
+                ruamel.yaml.dump(tree,
+                                 Dumper=ruamel.yaml.RoundTripDumper,
+                                 indent=4))
+        else:
+            fd.write(ruamel.yaml.dump(tree,
+                                      Dumper=ruamel.yaml.RoundTripDumper,
+                                      indent=4).encode('utf-8'))
     elif filetype == "json":
-        fd.write(json.dumps(tree, indent=4).encode('utf-8'))
+        jsonstr = json.dumps(tree, indent=4)
+        if path == 'stdout':
+            sys.stdout.write(jsonstr)
+        else:
+            fd.write(jsonstr.encode('utf-8'))
     else:
         if 'data' in tree:
             try:
-                fd.write(tree['data'].encode('utf-8'))
+                if path == 'stdout':
+                    sys.stdout.write(tree['data'])
+                else:
+                    fd.write(tree['data'].encode('utf-8'))
             except:
-                fd.write(tree['data'])
+                if path == 'stdout':
+                    sys.stdout.write(tree['data'].decode('utf-8'))
+                else:
+                    fd.write(tree['data'])
+            if path == 'stdout':
+                sys.stdout.write("\n")
+            else:
+                fd.write("\n")
         if 'sops' in tree:
             jsonstr = json.dumps(tree['sops'], sort_keys=True)
-            fd.write(("SOPS=%s" % jsonstr).encode('utf-8'))
-
-    fd.close()
+            if path == 'stdout':
+                sys.stdout.write("SOPS=%s" % jsonstr)
+            else:
+                fd.write("SOPS=%s" % jsonstr.encode('utf8'))
+    if path != 'stdout':
+        fd.close()
     return path
 
 
@@ -1082,7 +1282,7 @@ def validate_syntax(path, filetype):
     """Attempt to load a file and return an exception if it fails."""
     if filetype == 'bytes':
         return True
-    with open(path, "rb") as fd:
+    with open(path, "r") as fd:
         if filetype == 'yaml':
             ruamel.yaml.load(fd, ruamel.yaml.RoundTripLoader)
         if filetype == 'json':
@@ -1108,6 +1308,13 @@ def truncate_tree(tree, path):
     return tree
 
 
+def to_bytes(value):
+    if not isinstance(value, bytes):
+        # if not bytes, convert to bytes
+        return str(value).encode('utf-8')
+    return value
+
+
 def panic(msg, error_code=1):
     print("PANIC: %s" % msg, file=sys.stderr)
     sys.exit(error_code)
@@ -1121,7 +1328,7 @@ def check_latest_version():
     try:
         client = xmlrpclib.ServerProxy('https://pypi.python.org/pypi')
         latest = client.package_releases('sops')[0]
-        if VERSION < float(latest):
+        if A_is_newer_than_B(latest, VERSION):
             print("INFO: your version of sops is outdated. Version {latest} "
                   "is available, install it with "
                   "$ pip install 'sops=={latest}'."
@@ -1138,6 +1345,8 @@ def check_rotation_needed(tree):
     six_months_ago = datetime.utcnow()-timedelta(days=183)
     if 'kms' in tree['sops']:
         for entry in tree['sops']['kms']:
+            if not entry:
+                continue
             # check if creation date is older than 6 months
             if 'created_at' in entry:
                 d = datetime.strptime(entry['created_at'],
@@ -1147,6 +1356,8 @@ def check_rotation_needed(tree):
 
     if 'pgp' in tree['sops']:
         for entry in tree['sops']['pgp']:
+            if not entry:
+                continue
             # check if creation date is older than 6 months
             if 'created_at' in entry:
                 d = datetime.strptime(entry['created_at'],
@@ -1168,6 +1379,28 @@ def get_file_hash(path):
                 break
             digest.update(data)
     return digest.digest()
+
+
+def A_is_newer_than_B(A, B):
+    # semver comparison of two version strings
+    A_comp = str(A).split('.')
+    B_comp = str(B).split('.')
+    lim = len(A_comp)
+    if len(B_comp) < lim:
+        lim = len(B_comp)
+    is_equal = True
+    # Compare each component of the semver and if
+    # A is greated than B, return true
+    for i in range(0, lim):
+        if int(A_comp[i]) > int(B_comp[i]):
+            return True
+        if int(A_comp[i]) != int(B_comp[i]):
+            is_equal = False
+    # If the versions are equal but A has more components
+    # than B, A is considered newer (eg. 1.1.2 vs 1.1)
+    if is_equal and len(A_comp) > len(B_comp):
+        return True
+    return False
 
 
 if __name__ == '__main__':
